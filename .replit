@@ -1,6 +1,6 @@
 modules = ["python-3.11"]
 [nix]
-packages = ["nano"]
+packages = ["nano", "ffmpeg"]
 channel = "stable-25_05"
 
 [workflows]
