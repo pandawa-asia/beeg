@@ -134,7 +134,6 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "python-telegram-bot" },
     { name = "rich" },
-    { name = "telegram" },
     { name = "urllib3" },
     { name = "yt-dlp" },
 ]
@@ -144,7 +143,6 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "python-telegram-bot", specifier = ">=20.0" },
     { name = "rich", specifier = ">=14.3.3" },
-    { name = "telegram", specifier = ">=0.0.1" },
     { name = "urllib3", specifier = ">=2.6.3" },
     { name = "yt-dlp", specifier = ">=2024.0.0" },
 ]
@@ -161,12 +159,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/b3/c6/f3b320c27991c46f4
 wheels = [
     { url = "https://files.pythonhosted.org/packages/14/25/b208c5683343959b670dc001595f2f3737e051da617f66c31f7c4fa93abc/rich-14.3.3-py3-none-any.whl", hash = "sha256:793431c1f8619afa7d3b52b2cdec859562b950ea0d4b6b505397612db8d5362d", size = 310458, upload-time = "2026-02-19T17:23:13.732Z" },
 ]
-
-[[package]]
-name = "telegram"
-version = "0.0.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/9d/ca/8bdf2deb93b9f6971dabf2ddc827c2a98ce23e13582a15b37e9bc169f226/telegram-0.0.1.tar.gz", hash = "sha256:d405a0af4c868a8dbeae6d03e297e21c7ee6269e11e2ed3810e15544aba02591", size = 879, upload-time = "2015-09-29T07:32:18.348Z" }
 
 [[package]]
 name = "typing-extensions"
