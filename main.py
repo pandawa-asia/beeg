@@ -6,7 +6,7 @@ import time
 import json
 from pathlib import Path
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import asyncio
 import queue
@@ -83,7 +83,7 @@ processed_lock         = threading.Lock()
 active_downloads: dict = {}
 downloads_lock         = threading.Lock()
 
-# Riwayat folder per chat — {str(chat_id): ["FolderA", "FolderB", ...]}
+# Riwayat folder per chat
 folder_history: dict   = {}
 folder_history_lock    = threading.Lock()
 MAX_FOLDER_HISTORY     = 3
@@ -91,6 +91,18 @@ MAX_FOLDER_HISTORY     = 3
 # Link menunggu konfirmasi folder — {chat_id: {...}}
 pending_links: dict    = {}
 pending_links_lock     = threading.Lock()
+
+# Mode hapus link dari cache — {chat_id: True}
+remove_mode: dict      = {}
+remove_mode_lock       = threading.Lock()
+
+# Tracking URL yang pernah gagal — untuk koreksi stats saat retry sukses
+failed_urls: set       = set()
+failed_urls_lock       = threading.Lock()
+
+# Shutdown signal untuk graceful cleanup
+shutdown_event         = threading.Event()
+log_file               = "bot_activity.log"
 
 # ─────────────────────────────────────────────
 # 💾  Persistensi
@@ -132,7 +144,6 @@ def load_state() -> str:
         return ""
 
 def apply_download_dir(new_dir: str, chat_id=None):
-    """Terapkan folder baru secara global dan catat ke riwayat."""
     global DOWNLOAD_DIR
     DOWNLOAD_DIR = new_dir
     Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
@@ -169,7 +180,7 @@ def cleanup_old_files():
         print(f"[CLEANUP] {removed} file dihapus (>{CLEANUP_DAYS} hari)")
 
 # ─────────────────────────────────────────────
-# 🎨  Rich Progress
+# 🎨  Rich Progress & Logging
 # ─────────────────────────────────────────────
 progress_bar = Progress(
     SpinnerColumn(),
@@ -180,6 +191,16 @@ progress_bar = Progress(
 )
 SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 def get_spinner(i): return SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+
+def log_activity(msg: str):
+    """Log activity ke file dan console"""
+    timestamp = datetime.now().strftime("%d/%m %H:%M:%S")
+    log_msg = f"[{timestamp}] {msg}"
+    print(log_msg)
+    try:
+        with open(log_file, "a") as f:
+            f.write(log_msg + "\n")
+    except: pass
 
 # ─────────────────────────────────────────────
 # 🛠️  Helper
@@ -236,21 +257,28 @@ def get_referer(url: str) -> str:
         for domain, referer in CDN_REFERER_MAP.items():
             if host == domain or host.endswith("." + domain):
                 return referer
-        # Fallback: pakai origin domain URL itu sendiri
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.hostname}/"
     except Exception:
         return "https://www.google.com/"
 
-
 # ─────────────────────────────────────────────
 # 📥  Download engine
 # ─────────────────────────────────────────────
 def download_video(url, filename, folder, chat_id=None, retry=0, message_id=None):
+    if shutdown_event.is_set():
+        return False, None, "Bot sedang shutdown"
+    
     if retry >= MAX_RETRIES:
+        with failed_urls_lock:
+            failed_urls.add(url)
+        log_activity(f"[FINAL_FAIL] {url[:80]}... setelah {MAX_RETRIES} retry")
         return False, None, "Maksimal retry tercapai"
+    
     if retry > 0:
-        time.sleep(2 ** retry)
+        wait_time = min(2 ** retry, 30)  # Cap at 30s
+        log_activity(f"[RETRY {retry}] {url[:80]}... tunggu {wait_time}s")
+        time.sleep(wait_time)
 
     filepath = os.path.join(folder, filename)
     command = [
@@ -261,7 +289,7 @@ def download_video(url, filename, folder, chat_id=None, retry=0, message_id=None
         'ETA %(progress._eta_hms)s '
         '(frag %(progress._fragment_index)d/%(progress._fragment_count)d)',
         '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        '--add-header', f'Referer:{get_referer(url)}',   # ← dinamis
+        '--add-header', f'Referer:{get_referer(url)}',
         '--newline', '-o', filepath, url
     ]
 
@@ -324,8 +352,13 @@ def download_video(url, filename, folder, chat_id=None, retry=0, message_id=None
             os.remove(filepath)
         return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
 
+    except subprocess.TimeoutExpired:
+        log_activity(f"[TIMEOUT] {url[:80]}... ({TIMEOUT}s)")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
     except Exception as e:
-        print(f"[ERROR] {e}")
+        log_activity(f"[ERROR] {url[:80]}... {str(e)[:80]}")
         if os.path.exists(filepath):
             os.remove(filepath)
         return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
@@ -364,74 +397,95 @@ def send_message_sync(chat_id, text, message_id=None, reply_markup=None):
     return None
 
 # ─────────────────────────────────────────────
-# 👷  Worker — folder ikut di setiap item queue
+# 👷  Worker
 # ─────────────────────────────────────────────
 def worker():
-    while True:
-        item = download_queue.get()
-        if item is None:
-            break
+    while not shutdown_event.is_set():
+        try:
+            item = download_queue.get(timeout=2)
+            if item is None:
+                break
+        except queue.Empty:
+            continue
+        except Exception as e:
+            log_activity(f"[WORKER_ERROR] {str(e)[:100]}")
+            continue
 
-        url, custom_name, chat_id, folder = item
+        try:
+            url, custom_name, chat_id, folder = item
 
-        with stats_lock:
-            download_stats['queue_size'] = download_queue.qsize()
+            with stats_lock:
+                download_stats['queue_size'] = download_queue.qsize()
 
-        filename = custom_name or extract_filename_from_url(url)
+            filename = custom_name or extract_filename_from_url(url)
 
-        with downloads_lock:
-            active_downloads.setdefault(chat_id, []).append(filename)
+            with downloads_lock:
+                active_downloads.setdefault(chat_id, []).append(filename)
 
-        msg = send_message_sync(
-            chat_id,
-            f"⏬ *Memulai download...*\n"
-            f"📁 `{filename}`\n"
-            f"💾 Folder: `{folder}`\n"
-            f"📊 Antrian: {download_queue.qsize()}"
-        )
-        message_id = msg.message_id if msg else None
+            msg = send_message_sync(
+                chat_id,
+                f"⏬ *Memulai download...*\n"
+                f"📁 `{filename}`\n"
+                f"💾 Folder: `{folder}`\n"
+                f"📊 Antrian: {download_queue.qsize()}"
+            )
+            message_id = msg.message_id if msg else None
 
-        success, path, status = download_video(
-            url, filename, folder, chat_id, message_id=message_id
-        )
+            success, path, status = download_video(
+                url, filename, folder, chat_id, message_id=message_id
+            )
 
-        with downloads_lock:
-            lst = active_downloads.get(chat_id, [])
-            if filename in lst:
-                lst.remove(filename)
+            with downloads_lock:
+                lst = active_downloads.get(chat_id, [])
+                if filename in lst:
+                    lst.remove(filename)
 
-        with stats_lock:
-            if success:
-                download_stats['success'] += 1
-                send_message_sync(
-                    chat_id,
-                    f"✅ *Download Berhasil!*\n"
-                    f"📁 `{filename}`\n"
-                    f"💾 `{folder}`\n"
-                    f"ℹ️ {status}",
-                    message_id=message_id
-                )
-            else:
-                download_stats['failed'] += 1
-                send_message_sync(
-                    chat_id,
-                    f"❌ *Download Gagal*\n"
-                    f"📁 `{filename}`\n"
-                    f"⚠️ {status}",
-                    message_id=message_id
-                )
-            download_stats['queue_size'] = download_queue.qsize()
+            with stats_lock:
+                if success:
+                    download_stats['success'] += 1
+                    # Jika ini retry dari yang pernah gagal, kurangi failed
+                    with failed_urls_lock:
+                        if url in failed_urls:
+                            failed_urls.discard(url)
+                            download_stats['failed'] = max(0, download_stats['failed'] - 1)
+                    send_message_sync(
+                        chat_id,
+                        f"✅ *Download Berhasil!*\n"
+                        f"📁 `{filename}`\n"
+                        f"💾 `{folder}`\n"
+                        f"ℹ️ {status}",
+                        message_id=message_id
+                    )
+                else:
+                    download_stats['failed'] += 1
+                    # Catat URL gagal & hapus dari cache agar bisa di-retry
+                    with processed_lock:
+                        processed_links.discard(url)
+                    with failed_urls_lock:
+                        failed_urls.add(url)
+                    send_message_sync(
+                        chat_id,
+                        f"❌ *Download Gagal*\n"
+                        f"📁 `{filename}`\n"
+                        f"⚠️ {status}\n\n"
+                        f"🔁 Link sudah dihapus dari cache, kirim ulang untuk retry.",
+                        message_id=message_id
+                    )
+                download_stats['queue_size'] = download_queue.qsize()
 
-        save_state()
-        download_queue.task_done()
+            save_state()
+        finally:
+            download_queue.task_done()
 
 def worker_wrapper(wid):
-    while True:
+    while not shutdown_event.is_set():
         try:
             worker()
         except Exception as e:
-            print(f"  ⚠️ Worker-{wid} crash: {e} — restart 5s...")
-            time.sleep(5)
+            if not shutdown_event.is_set():
+                log_activity(f"  ⚠️ Worker-{wid} crash: {e} — restart 5s...")
+                time.sleep(5)
+    log_activity(f"✅ Worker-{wid} stopped gracefully")
 
 # ─────────────────────────────────────────────
 # 🔐  Auth decorator
@@ -453,57 +507,55 @@ def require_auth(handler):
 # ─────────────────────────────────────────────
 # ⌨️  Keyboards
 # ─────────────────────────────────────────────
-def get_main_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Statistik"),    KeyboardButton("📋 Antrian")],
-        [KeyboardButton("📁 Ganti Folder"), KeyboardButton("🗑️ Clear Cache")],
-        [KeyboardButton("❓ Bantuan")]
-    ], resize_keyboard=True)
-
-def get_inline_menu_keyboard():
+def get_main_inline_keyboard():
+    """Inline menu utama."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Statistik",    callback_data="stats"),
          InlineKeyboardButton("📋 Antrian",      callback_data="queue")],
         [InlineKeyboardButton("📁 Ganti Folder", callback_data="change_folder"),
-         InlineKeyboardButton("❓ Help",          callback_data="help")],
-        [InlineKeyboardButton("🔄 Refresh",      callback_data="refresh")]
+         InlineKeyboardButton("🗑️ Kelola Cache", callback_data="cache_menu")],
+        [InlineKeyboardButton("❓ Bantuan",       callback_data="help"),
+         InlineKeyboardButton("🔄 Refresh",      callback_data="refresh_menu")]
+    ])
+
+def get_cache_menu_keyboard():
+    """Sub-menu kelola cache."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ Hapus Semua Cache",    callback_data="clear_all_cache")],
+        [InlineKeyboardButton("✂️ Hapus Link Tertentu",  callback_data="remove_link")],
+        [InlineKeyboardButton("🔙 Kembali",              callback_data="menu")]
     ])
 
 def get_stats_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="stats"),
-         InlineKeyboardButton("🗑️ Clear",  callback_data="clear_stats")],
-        [InlineKeyboardButton("🔙 Menu",    callback_data="menu")]
+        [InlineKeyboardButton("🔄 Refresh",     callback_data="stats"),
+         InlineKeyboardButton("🗑️ Reset Stats", callback_data="clear_stats")],
+        [InlineKeyboardButton("🔙 Menu Utama",  callback_data="menu")]
     ])
 
 def get_queue_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="queue")],
-        [InlineKeyboardButton("🔙 Menu",    callback_data="menu")]
+        [InlineKeyboardButton("🔄 Refresh",    callback_data="queue")],
+        [InlineKeyboardButton("🔙 Menu Utama", callback_data="menu")]
+    ])
+
+def get_back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Menu Utama", callback_data="menu")]
     ])
 
 def build_folder_choice_keyboard(chat_id) -> InlineKeyboardMarkup:
-    """
-    Keyboard pilihan folder — muncul setiap kali link dikirim.
-    Urutan:
-      1. Folder aktif saat ini
-      2. Riwayat folder (maks 3, skip duplikat & default)
-      3. Folder default (jika belum tampil)
-      4. Buat folder baru
-    """
     rows  = []
     shown = set()
 
-    # ── 1. Folder aktif ──
     if DOWNLOAD_DIR:
-        icon  = "🏠" if DOWNLOAD_DIR == DOWNLOAD_DIR_DEFAULT else "📂"
+        icon = "🏠" if DOWNLOAD_DIR == DOWNLOAD_DIR_DEFAULT else "📂"
         rows.append([InlineKeyboardButton(
             f"{icon} Lanjutkan  ·  {DOWNLOAD_DIR}",
             callback_data=f"dlf_use|{DOWNLOAD_DIR}"
         )])
         shown.add(DOWNLOAD_DIR)
 
-    # ── 2. Riwayat ──
     for h in get_folder_history(chat_id):
         if h not in shown and h != DOWNLOAD_DIR_DEFAULT:
             rows.append([InlineKeyboardButton(
@@ -511,22 +563,16 @@ def build_folder_choice_keyboard(chat_id) -> InlineKeyboardMarkup:
             )])
             shown.add(h)
 
-    # ── 3. Default (jika belum tampil) ──
     if DOWNLOAD_DIR_DEFAULT not in shown:
         rows.append([InlineKeyboardButton(
             f"🏠 Default  ·  {DOWNLOAD_DIR_DEFAULT}",
             callback_data=f"dlf_use|{DOWNLOAD_DIR_DEFAULT}"
         )])
 
-    # ── 4. Buat folder baru ──
-    rows.append([InlineKeyboardButton(
-        "✏️ Folder baru…", callback_data="dlf_new"
-    )])
-
+    rows.append([InlineKeyboardButton("✏️ Folder baru…", callback_data="dlf_new")])
     return InlineKeyboardMarkup(rows)
 
 def build_global_folder_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard untuk /folder — ubah folder aktif secara global."""
     rows  = []
     shown = set()
 
@@ -543,9 +589,8 @@ def build_global_folder_keyboard() -> InlineKeyboardMarkup:
             callback_data=f"gf_use|{DOWNLOAD_DIR_DEFAULT}"
         )])
 
-    rows.append([InlineKeyboardButton(
-        "✏️ Ketik nama folder baru", callback_data="gf_new"
-    )])
+    rows.append([InlineKeyboardButton("✏️ Ketik nama folder baru", callback_data="gf_new")])
+    rows.append([InlineKeyboardButton("🔙 Kembali", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
 # ─────────────────────────────────────────────
@@ -563,8 +608,10 @@ def queue_links_to_download(links: list, chat_id: int, folder: str):
         try:
             download_queue.put((link, None, chat_id, folder), timeout=1)
             added += 1
-            with stats_lock:
-                download_stats['total'] += 1
+            with stats_lock, failed_urls_lock:
+                # Hanya +total jika bukan retry dari link yang pernah gagal
+                if link not in failed_urls:
+                    download_stats['total'] += 1
         except queue.Full:
             full = True
             break
@@ -575,212 +622,126 @@ def format_queue_result(added: int, dupes: int, full: bool, folder: str) -> str:
         f"✅ *{added} link* dimasukkan antrian\n"
         f"💾 Folder: `{folder}`\n"
     )
-    if dupes: result += f"⏭️ Duplikat: {dupes}\n"
+    if dupes: result += f"⏭️ Duplikat dilewati: {dupes}\n"
     if full:  result += "⚠️ Beberapa link gagal (antrian penuh)\n"
     result += f"📊 Posisi antrian: {download_queue.qsize()}"
     return result
 
 # ─────────────────────────────────────────────
-# 🤖  Command handlers
+# 📄  Page builders
 # ─────────────────────────────────────────────
-@require_auth
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    with active_chats_lock:
-        active_chats[chat_id] = context.application
-
+def build_home_text() -> str:
     folder_info = f"`{DOWNLOAD_DIR}`" if DOWNLOAD_DIR else "_belum diset_"
-    await update.message.reply_text(
+    with stats_lock:
+        qs = download_stats['queue_size']
+    return (
         "🎬 *Video Downloader Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🚀 *Bot siap digunakan!*\n\n"
-        "📥 *Cara Menggunakan:*\n"
-        "1️⃣ Kirim link video\n"
-        "2️⃣ Pilih folder tujuan download\n"
-        "3️⃣ Tunggu notifikasi selesai\n\n"
-        f"📁 *Folder aktif:* {folder_info}\n\n"
-        "Kirim link atau pilih menu! 👇",
-        parse_mode='Markdown',
-        reply_markup=get_main_keyboard()
-    )
-    await update.message.reply_text(
-        "📌 *Quick Menu:*",
-        parse_mode='Markdown',
-        reply_markup=get_inline_menu_keyboard()
+        f"📁 *Folder aktif:* {folder_info}\n"
+        f"📋 *Antrian:* {qs} item\n\n"
+        "Kirim link video kapan saja,\natau pilih menu di bawah 👇"
     )
 
-@require_auth
-async def folder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ubah folder aktif global — /folder atau tombol."""
-    chat_id = update.effective_chat.id
-    with active_chats_lock:
-        active_chats[chat_id] = context.application
-
-    folder_info = f"`{DOWNLOAD_DIR}`" if DOWNLOAD_DIR else "_belum diset_"
-    text = (
-        "📁 *Ganti Folder Aktif*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📌 Saat ini: {folder_info}\n\n"
-        "Pilih folder atau buat baru:"
-    )
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            text, parse_mode='Markdown',
-            reply_markup=build_global_folder_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            text, parse_mode='Markdown',
-            reply_markup=build_global_folder_keyboard()
-        )
-
-@require_auth
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_stats_text() -> str:
     with stats_lock:
         uptime = datetime.now() - download_stats['start_time']
         total  = download_stats['success'] + download_stats['failed']
         rate   = (download_stats['success'] / total * 100) if total else 0
-        text   = (
+        return (
             "📊 *STATISTIK DOWNLOAD*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ *Berhasil:* {download_stats['success']}\n"
-            f"❌ *Gagal:* {download_stats['failed']}\n"
-            f"📈 *Total:* {total}\n"
-            f"🎯 *Success Rate:* {rate:.1f}%\n\n"
-            f"📋 *Antrian:* {download_stats['queue_size']}\n"
-            f"👷 *Workers:* {MAX_WORKERS}\n"
-            f"📁 *Folder:* `{DOWNLOAD_DIR or 'belum diset'}`\n"
+            f"✅ *Berhasil:*    {download_stats['success']}\n"
+            f"❌ *Gagal:*       {download_stats['failed']}\n"
+            f"📈 *Total:*       {total}\n"
+            f"🎯 *Sukses Rate:* {rate:.1f}%\n\n"
+            f"📋 *Antrian:*     {download_stats['queue_size']}\n"
+            f"👷 *Workers:*     {MAX_WORKERS}\n"
+            f"📁 *Folder:*      `{DOWNLOAD_DIR or 'belum diset'}`\n"
             f"🔗 *Cache Links:* {len(processed_links)}\n\n"
-            f"⏱️ *Uptime:* {format_duration(uptime.total_seconds())}\n"
-            f"🕐 *Start:* {download_stats['start_time'].strftime('%d/%m %H:%M')}"
-        )
-    if update.callback_query:
-        try:
-            await update.callback_query.answer("Statistik diperbarui!")
-            await update.callback_query.edit_message_text(
-                text, parse_mode='Markdown', reply_markup=get_stats_keyboard()
-            )
-        except BadRequest as e:
-            if "Message is not modified" not in str(e): raise
-    else:
-        await update.message.reply_text(
-            text, parse_mode='Markdown', reply_markup=get_stats_keyboard()
+            f"⏱️ *Uptime:*      {format_duration(uptime.total_seconds())}\n"
+            f"🕐 *Start:*       {download_stats['start_time'].strftime('%d/%m %H:%M')}"
         )
 
-@require_auth
-async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_queue_text() -> str:
     qs   = download_queue.qsize()
     acts = []
     with downloads_lock:
         for files in active_downloads.values():
-            acts.extend(files[:3])
-
+            acts.extend(files[:5])
     text = (
         "📋 *STATUS ANTRIAN*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📦 *Total Antrian:* {qs}\n"
-        f"👷 *Worker Aktif:* {MAX_WORKERS}\n"
-        f"📊 *Kapasitas:* {MAX_QUEUE_SIZE}\n"
-        f"📈 *Slot Tersisa:* {MAX_QUEUE_SIZE - qs}\n\n"
+        f"👷 *Worker Aktif:*  {MAX_WORKERS}\n"
+        f"📊 *Kapasitas:*     {MAX_QUEUE_SIZE}\n"
+        f"📈 *Slot Tersisa:*  {MAX_QUEUE_SIZE - qs}\n\n"
     )
     if acts:
         text += "⚡ *Sedang Diproses:*\n"
-        for i, f in enumerate(acts[:3], 1):
-            s = f[:30] + "..." if len(f) > 30 else f
-            text += f"{i}. `{s}`\n"
+        for i, f in enumerate(acts[:5], 1):
+            s = f[:35] + "…" if len(f) > 35 else f
+            text += f"`{i}.` `{s}`\n"
     else:
-        text += "✨ *Tidak ada download aktif*"
+        text += "✨ _Tidak ada download aktif_"
+    return text
 
-    if update.callback_query:
-        try:
-            await update.callback_query.answer("Antrian diperbarui!")
-            await update.callback_query.edit_message_text(
-                text, parse_mode='Markdown', reply_markup=get_queue_keyboard()
-            )
-        except BadRequest as e:
-            if "Message is not modified" not in str(e): raise
-    else:
-        await update.message.reply_text(
-            text, parse_mode='Markdown', reply_markup=get_queue_keyboard()
-        )
-
-@require_auth
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+def build_help_text() -> str:
+    return (
         "❓ *PANDUAN PENGGUNAAN*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "*📝 Commands:*\n"
-        "`/start`  - Mulai bot\n"
-        "`/stats`  - Statistik\n"
-        "`/queue`  - Info antrian\n"
-        "`/folder` - Ganti folder aktif\n"
-        "`/clear`  - Clear cache link\n"
-        "`/help`   - Panduan ini\n\n"
-        "*🎯 Cara Pakai:*\n"
-        "1. Kirim link video ke chat\n"
-        "2. Bot tanya mau simpan ke folder mana:\n"
-        "   📂 Lanjutkan di folder aktif\n"
-        "   🕒 Pilih dari riwayat folder\n"
-        "   🏠 Pilih folder default\n"
-        "   ✏️ Ketik nama folder baru\n"
-        "3. Download mulai otomatis\n\n"
+        "*📥 Download Video:*\n"
+        "Kirim link video ke chat ini.\n"
+        "Bot akan tanya folder tujuan, lalu download otomatis.\n\n"
+        "*📁 Folder:*\n"
+        "• Pilih folder aktif yang sudah ada\n"
+        "• Pilih dari riwayat folder terakhir\n"
+        "• Atau ketik nama folder baru\n\n"
+        "*🗑️ Kelola Cache:*\n"
+        "• *Hapus Semua* — semua link bisa download ulang\n"
+        "• *Hapus Link Tertentu* — kirim link yang ingin dihapus\n"
+        "• Link yang *gagal* otomatis dihapus dari cache\n\n"
         "*⚙️ Spesifikasi:*\n"
         f"• Folder aktif : `{DOWNLOAD_DIR or 'belum diset'}`\n"
         f"• Max antrian  : {MAX_QUEUE_SIZE}\n"
         f"• Workers      : {MAX_WORKERS}\n"
-        f"• Retry        : {MAX_RETRIES}x\n"
-        f"• Cleanup      : >{CLEANUP_DAYS} hari"
+        f"• Retry        : {MAX_RETRIES}×\n"
+        f"• Auto-cleanup : >{CLEANUP_DAYS} hari"
     )
-    kb = [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]
-    if update.callback_query:
-        try:
-            await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
-            )
-        except BadRequest as e:
-            if "Message is not modified" not in str(e): raise
-    else:
-        await update.message.reply_text(
-            text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
-        )
 
-@require_auth
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_cache_menu_text() -> str:
     with processed_lock:
         count = len(processed_links)
-        processed_links.clear()
-    save_state()
-    text = (
-        "🗑️ *CACHE CLEARED*\n"
+    return (
+        "🗑️ *KELOLA CACHE LINK*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"✅ {count} link dihapus dari cache\n\n"
-        "Link bisa di-download ulang sekarang!"
+        f"📦 *Link di cache:* {count}\n\n"
+        "Cache mencegah link yang sama didownload dua kali.\n"
+        "Hapus jika ingin download ulang link lama.\n\n"
+        "Pilih aksi:"
     )
-    kb = [[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]
-    if update.callback_query:
-        await update.callback_query.answer("Cache dibersihkan!")
-        await update.callback_query.edit_message_text(
-            text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
-        )
-    else:
-        await update.message.reply_text(
-            text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(kb)
-        )
-
-async def clear_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with stats_lock:
-        download_stats.update({
-            'success': 0, 'failed': 0, 'total': 0,
-            'start_time': datetime.now()
-        })
-    save_state()
-    await update.callback_query.answer("Statistik direset!")
-    await stats_command(update, context)
 
 # ─────────────────────────────────────────────
-# 🔘  Callback handler
+# 🤖  Handlers
+# ─────────────────────────────────────────────
+@require_auth
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point — satu-satunya command."""
+    chat_id = update.effective_chat.id
+    with active_chats_lock:
+        active_chats[chat_id] = context.application
+
+    # Hapus reply keyboard lama yang tersisa di Telegram client
+    rm_msg = await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
+    await rm_msg.delete()
+
+    await update.message.reply_text(
+        build_home_text(),
+        parse_mode='Markdown',
+        reply_markup=get_main_inline_keyboard()
+    )
+
+# ─────────────────────────────────────────────
+# 🔘  Callback — semua inline button
 # ─────────────────────────────────────────────
 @require_auth
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -788,26 +749,135 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = query.data
     chat_id = update.effective_chat.id
 
-    # ── Pilih folder untuk download link yang pending ──
-    if data.startswith("dlf_use|"):
+    # ── Menu utama ──
+    if data in ("menu", "refresh_menu"):
+        await query.answer("Diperbarui!" if data == "refresh_menu" else "")
+        try:
+            await query.edit_message_text(
+                build_home_text(), parse_mode='Markdown',
+                reply_markup=get_main_inline_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    # ── Statistik ──
+    elif data == "stats":
+        try:
+            await query.answer("Diperbarui!")
+            await query.edit_message_text(
+                build_stats_text(), parse_mode='Markdown',
+                reply_markup=get_stats_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    elif data == "clear_stats":
+        with stats_lock:
+            download_stats.update({'success': 0, 'failed': 0, 'total': 0, 'start_time': datetime.now()})
+        save_state()
+        await query.answer("Statistik direset!")
+        try:
+            await query.edit_message_text(
+                build_stats_text(), parse_mode='Markdown',
+                reply_markup=get_stats_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    # ── Antrian ──
+    elif data == "queue":
+        try:
+            await query.answer("Diperbarui!")
+            await query.edit_message_text(
+                build_queue_text(), parse_mode='Markdown',
+                reply_markup=get_queue_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    # ── Bantuan ──
+    elif data == "help":
+        try:
+            await query.answer()
+            await query.edit_message_text(
+                build_help_text(), parse_mode='Markdown',
+                reply_markup=get_back_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    # ── Cache menu ──
+    elif data == "cache_menu":
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                build_cache_menu_text(), parse_mode='Markdown',
+                reply_markup=get_cache_menu_keyboard()
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
+
+    elif data == "clear_all_cache":
+        with processed_lock:
+            count = len(processed_links)
+            processed_links.clear()
+        save_state()
+        await query.answer(f"✅ {count} link dihapus!")
+        await query.edit_message_text(
+            f"🗑️ *Cache Dibersihkan*\n\n"
+            f"✅ {count} link dihapus dari cache.\n\n"
+            "Semua link bisa didownload ulang sekarang!",
+            parse_mode='Markdown',
+            reply_markup=get_back_keyboard()
+        )
+
+    elif data == "remove_link":
+        with remove_mode_lock:
+            remove_mode[chat_id] = True
+        await query.answer()
+        await query.edit_message_text(
+            "✂️ *Hapus Link Tertentu dari Cache*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Kirim link yang ingin dihapus dari cache.\n"
+            "Bisa kirim beberapa link sekaligus (satu per baris).\n\n"
+            "_Tekan Selesai untuk keluar dari mode ini._",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Selesai", callback_data="remove_cancel")]
+            ])
+        )
+
+    elif data == "remove_cancel":
+        with remove_mode_lock:
+            remove_mode.pop(chat_id, None)
+        await query.answer("Selesai.")
+        await query.edit_message_text(
+            build_cache_menu_text(), parse_mode='Markdown',
+            reply_markup=get_cache_menu_keyboard()
+        )
+
+    # ── Folder untuk link pending ──
+    elif data.startswith("dlf_use|"):
         chosen = data.split("|", 1)[1]
         with pending_links_lock:
             pending = pending_links.pop(chat_id, None)
         if not pending:
             await query.answer("⚠️ Sesi habis, kirim link lagi.")
-            await query.edit_message_text("⚠️ Sesi habis. Silakan kirim link lagi.")
+            await query.edit_message_text(
+                "⚠️ Sesi habis. Silakan kirim link lagi.",
+                reply_markup=get_back_keyboard()
+            )
             return
         links = pending.get("links", [])
         apply_download_dir(chosen, chat_id)
         added, dupes, full = queue_links_to_download(links, chat_id, chosen)
-        await query.answer(f"✅ Folder: {chosen}")
+        await query.answer(f"✅ {added} link masuk antrian")
         await query.edit_message_text(
             format_queue_result(added, dupes, full, chosen),
             parse_mode='Markdown'
         )
 
     elif data == "dlf_new":
-        # User mau ketik folder baru untuk link ini
         with pending_links_lock:
             if chat_id in pending_links:
                 pending_links[chat_id]["waiting_custom"] = True
@@ -819,7 +889,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-    # ── Ubah folder aktif global ──
+    # ── Folder global ──
+    elif data == "change_folder":
+        folder_info = f"`{DOWNLOAD_DIR}`" if DOWNLOAD_DIR else "_belum diset_"
+        await query.answer()
+        await query.edit_message_text(
+            f"📁 *Ganti Folder Aktif*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 Saat ini: {folder_info}\n\n"
+            "Pilih folder atau buat baru:",
+            parse_mode='Markdown',
+            reply_markup=build_global_folder_keyboard()
+        )
+
     elif data.startswith("gf_use|"):
         chosen = data.split("|", 1)[1]
         apply_download_dir(chosen, chat_id)
@@ -827,18 +909,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ *Folder Aktif Diubah*\n\n"
             f"📁 `{chosen}`\n\n"
-            "Folder ini akan muncul sebagai pilihan pertama saat kirim link.",
+            "Folder ini menjadi pilihan pertama saat kirim link.",
             parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Menu", callback_data="menu")]
-            ])
+            reply_markup=get_back_keyboard()
         )
 
     elif data == "gf_new":
         with pending_links_lock:
-            pending_links[chat_id] = {
-                "links": [], "waiting_custom": True, "global_folder": True
-            }
+            pending_links[chat_id] = {"links": [], "waiting_custom": True, "global_folder": True}
         await query.answer()
         await query.edit_message_text(
             "✏️ *Ketik nama folder baru:*\n\n"
@@ -847,27 +925,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-    # ── Navigasi menu ──
-    elif data == "stats":           await stats_command(update, context)
-    elif data == "queue":           await queue_command(update, context)
-    elif data == "help":            await help_command(update, context)
-    elif data == "clear_cache":     await clear_command(update, context)
-    elif data == "clear_stats":     await clear_stats_callback(update, context)
-    elif data == "change_folder":   await folder_command(update, context)
-    elif data == "menu":
-        await query.answer()
-        folder_info = f"`{DOWNLOAD_DIR}`" if DOWNLOAD_DIR else "_belum diset_"
-        await query.edit_message_text(
-            "🎬 *Video Downloader Bot*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📁 Folder aktif: {folder_info}\n\n"
-            "Pilih menu atau kirim link! 👇",
-            parse_mode='Markdown',
-            reply_markup=get_inline_menu_keyboard()
-        )
-    elif data == "refresh":
-        await query.answer("Menu diperbarui!")
-        await query.edit_message_reply_markup(reply_markup=get_inline_menu_keyboard())
     else:
         await query.answer()
 
@@ -885,7 +942,56 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     with active_chats_lock:
         active_chats[chat_id] = context.application
 
-    # ── Cek apakah menunggu input nama folder custom ──
+    # ── Mode hapus link tertentu ──
+    in_remove_mode = False
+    with remove_mode_lock:
+        in_remove_mode = remove_mode.get(chat_id, False)
+
+    if in_remove_mode:
+        links = re.findall(
+            r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+            text
+        )
+        if not links:
+            await update.message.reply_text(
+                "❌ Tidak ada link yang ditemukan.\n"
+                "Kirim link yang ingin dihapus, atau tekan *Selesai*.",
+                parse_mode='Markdown'
+            )
+            return
+
+        removed = []
+        not_found = []
+        with processed_lock:
+            for link in links:
+                if link in processed_links:
+                    processed_links.discard(link)
+                    removed.append(link)
+                else:
+                    not_found.append(link)
+        save_state()
+
+        lines = ["✂️ *Hasil Hapus Cache*\n━━━━━━━━━━━━━━━━━━━━\n"]
+        if removed:
+            lines.append(f"✅ *{len(removed)} link dihapus:*")
+            for l in removed:
+                lines.append(f"• `{l[:60]}{'…' if len(l) > 60 else ''}`")
+        if not_found:
+            lines.append(f"\n⚠️ *{len(not_found)} tidak ada di cache:*")
+            for l in not_found:
+                lines.append(f"• `{l[:60]}{'…' if len(l) > 60 else ''}`")
+        lines.append("\n_Kirim link lain, atau tekan Selesai._")
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Selesai", callback_data="remove_cancel")]
+            ])
+        )
+        return
+
+    # ── Mode input nama folder custom ──
     waiting_custom  = False
     is_global_setup = False
     with pending_links_lock:
@@ -903,19 +1009,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if is_global_setup:
-            # Ubah folder aktif global
             apply_download_dir(folder_name, chat_id)
             with pending_links_lock:
                 pending_links.pop(chat_id, None)
             await update.message.reply_text(
                 f"✅ *Folder Aktif Diubah*\n\n"
                 f"📁 `{DOWNLOAD_DIR}`\n\n"
-                "Folder ini akan muncul sebagai pilihan pertama saat kirim link.",
+                "Folder ini menjadi pilihan pertama saat kirim link.",
                 parse_mode='Markdown',
-                reply_markup=get_main_keyboard()
+                reply_markup=get_back_keyboard()
             )
         else:
-            # Lanjutkan download ke folder baru yang diketik
             with pending_links_lock:
                 pend = pending_links.pop(chat_id, {})
             links = pend.get("links", [])
@@ -927,19 +1031,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         return
 
-    # ── Tombol keyboard utama ──
-    if text == "📊 Statistik":
-        await stats_command(update, context); return
-    elif text == "📋 Antrian":
-        await queue_command(update, context); return
-    elif text == "📁 Ganti Folder":
-        await folder_command(update, context); return
-    elif text == "🗑️ Clear Cache":
-        await clear_command(update, context); return
-    elif text == "❓ Bantuan":
-        await help_command(update, context); return
-
-    # ── Deteksi link ──
+    # ── Deteksi link video ──
     links = re.findall(
         r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
         text
@@ -947,26 +1039,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not links:
         await update.message.reply_text(
-            "❌ *Tidak Ada Link*\n\n"
-            "Tidak ditemukan link yang valid.\n\n"
-            "Contoh:\n"
-            "• `https://example.com/video.mp4`\n"
-            "• `https://example.com/stream.m3u8`",
+            "❌ *Tidak ada link yang valid.*\n\n"
+            "Kirim link video, atau pilih menu di bawah.",
             parse_mode='Markdown'
         )
         return
 
-    # ── Simpan link & tanya folder ──
+    # Simpan link & tanya folder tujuan
     with pending_links_lock:
-        pending_links[chat_id] = {
-            "links": links,
-            "waiting_custom": False,
-            "global_folder": False
-        }
+        pending_links[chat_id] = {"links": links, "waiting_custom": False, "global_folder": False}
 
     count   = len(links)
-    preview = f"`{links[0][:60]}{'...' if len(links[0]) > 60 else ''}`"
-    suffix  = f" *(+{count - 1} lainnya)*" if count > 1 else ""
+    preview = f"`{links[0][:60]}{'…' if len(links[0]) > 60 else ''}`"
+    suffix  = f" _( +{count - 1} lainnya)_" if count > 1 else ""
 
     await update.message.reply_text(
         f"🔗 *{count} link diterima*{suffix}\n"
@@ -1010,12 +1095,8 @@ def run_bot():
             .build()
         )
 
-        app.add_handler(CommandHandler("start",  start_command))
-        app.add_handler(CommandHandler("stats",  stats_command))
-        app.add_handler(CommandHandler("queue",  queue_command))
-        app.add_handler(CommandHandler("folder", folder_command))
-        app.add_handler(CommandHandler("help",   help_command))
-        app.add_handler(CommandHandler("clear",  clear_command))
+        # Hanya /start — semua fitur lain via menu tombol
+        app.add_handler(CommandHandler("start", start_handler))
         app.add_handler(CallbackQueryHandler(button_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
@@ -1063,8 +1144,12 @@ def run_bot():
         import traceback
         traceback.print_exc()
     finally:
+        shutdown_event.set()
+        print("🛑 Menunggu workers shutdown...")
+        time.sleep(2)
         save_state()
         progress_bar.stop()
+        log_activity("[SHUTDOWN] Bot stopped")
 
 if __name__ == "__main__":
     print("🎬 Video Downloader Bot Starting...")
