@@ -131,5 +131,8 @@ dist
 
 # Replit debugger
 .breakpoints
-AsianGirl/
+
+# Downloaded videos & custom folders
+Downloads/
 bot_state.json
+bot_activity.log

@@ -13,6 +13,24 @@ Bot Telegram yang download video dari berbagai platform (XHamster, Pornhub, XVid
 - **Folder management**: User bisa pilih/buat folder, history 3 terakhir tersimpan
 - **Progress tracking**: Real-time updates via Telegram + Rich progress bars
 
+## 📁 Folder Structure
+
+```
+project/
+├── main.py
+├── replit.md
+├── .gitignore (ignores Downloads/ & bot_state.json)
+├── Downloads/           ← Semua download ada sini
+│   ├── .gitkeep        ← Folder tetap tercatat di git
+│   ├── AsianGirl/      ← Default folder
+│   ├── MyFolder/       ← Custom folders user
+│   └── Videos2024/
+├── bot_state.json      ← Persistent state (ignored)
+└── bot_activity.log    ← Activity log (ignored)
+```
+
+⚠️ **PENTING:** `Downloads/` tidak akan ter-commit ke GitHub — hanya `.gitkeep` supaya folder tersimpan.
+
 ### Fitur:
 
 #### 1. Download Video
@@ -38,6 +56,18 @@ Bot Telegram yang download video dari berbagai platform (XHamster, Pornhub, XVid
 - Activity logging ke `bot_activity.log`
 
 ## 🔧 Konfigurasi
+
+## 🔄 Migration dari Old Folder Structure
+
+Jika ada folder lama (`AsianGirl/`, `Gattouz/`, dll):
+- Folder lama tetap ada dan masih berfungsi
+- Setelah next restart, bot akan switch ke `Downloads/AsianGirl` (default baru)
+- Bisa manual pindah dengan `/start` → pilih folder atau ganti ke `Downloads/FolderName`
+
+**Best practice:**
+- Kirim `/start` untuk reset ke default baru
+- Atau pilih "Folder baru" dan ketik `Downloads/NamaFolder`
+- Folder akan auto-created di dalam `Downloads/`
 
 ### Environment Variables:
 ```

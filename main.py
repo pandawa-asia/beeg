@@ -44,7 +44,7 @@ STATE_FILE            = os.getenv("STATE_FILE", "bot_state.json")
 CLEANUP_DAYS          = int(os.getenv("CLEANUP_DAYS", 7))
 PROGRESS_THROTTLE_SEC = float(os.getenv("PROGRESS_THROTTLE", 3))
 
-DOWNLOAD_DIR_DEFAULT  = "AsianGirl"
+DOWNLOAD_DIR_DEFAULT  = "Downloads/AsianGirl"
 DOWNLOAD_DIR: str     = os.getenv("DOWNLOAD_DIR", "")
 
 # ─────────────────────────────────────────────
