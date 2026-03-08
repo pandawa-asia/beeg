@@ -44,8 +44,9 @@ STATE_FILE            = os.getenv("STATE_FILE", "bot_state.json")
 CLEANUP_DAYS          = int(os.getenv("CLEANUP_DAYS", 7))
 PROGRESS_THROTTLE_SEC = float(os.getenv("PROGRESS_THROTTLE", 3))
 
-DOWNLOAD_DIR_DEFAULT  = "Downloads/AsianGirl"
-DOWNLOAD_DIR: str     = os.getenv("DOWNLOAD_DIR", "")
+DOWNLOAD_DIR_DEFAULT  = "AsianGirl"
+DOWNLOAD_DIR: str     = ""  # akan di-normalize di run_bot()
+_DOWNLOAD_DIR_ENV: str = os.getenv("DOWNLOAD_DIR", "")
 
 # ─────────────────────────────────────────────
 # 🔧  Patch IPv4
@@ -100,10 +101,6 @@ remove_mode_lock       = threading.Lock()
 failed_urls: set       = set()
 failed_urls_lock       = threading.Lock()
 
-# Shutdown signal untuk graceful cleanup
-shutdown_event         = threading.Event()
-log_file               = "bot_activity.log"
-
 # ─────────────────────────────────────────────
 # 💾  Persistensi
 # ─────────────────────────────────────────────
@@ -138,21 +135,31 @@ def load_state() -> str:
                     download_stats[k] = saved[k]
         saved_dir = data.get("download_dir", "")
         print(f"[STATE] Dimuat: {len(processed_links)} link, dir='{saved_dir}'")
-        return saved_dir
+        return normalize_dir(saved_dir) if saved_dir else ""
     except Exception as e:
         print(f"[WARN] Gagal load state: {e}")
         return ""
 
+BASE_DIR = "Downloads"
+
+def normalize_dir(name: str) -> str:
+    """Pastikan semua folder selalu di dalam Downloads/."""
+    if name.startswith(BASE_DIR + "/") or name == BASE_DIR:
+        return name
+    return f"{BASE_DIR}/{name}"
+
 def apply_download_dir(new_dir: str, chat_id=None):
     global DOWNLOAD_DIR
-    DOWNLOAD_DIR = new_dir
-    Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
-    if chat_id and new_dir != DOWNLOAD_DIR_DEFAULT:
+    DOWNLOAD_DIR = normalize_dir(new_dir)
+    Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    # Bandingkan setelah normalisasi agar konsisten
+    default_normalized = normalize_dir(DOWNLOAD_DIR_DEFAULT)
+    if chat_id and DOWNLOAD_DIR != default_normalized:
         with folder_history_lock:
             history = folder_history.setdefault(str(chat_id), [])
-            if new_dir in history:
-                history.remove(new_dir)
-            history.insert(0, new_dir)
+            if DOWNLOAD_DIR in history:
+                history.remove(DOWNLOAD_DIR)
+            history.insert(0, DOWNLOAD_DIR)
             folder_history[str(chat_id)] = history[:MAX_FOLDER_HISTORY]
     save_state()
     print(f"[FOLDER] Diset: '{DOWNLOAD_DIR}'")
@@ -180,7 +187,7 @@ def cleanup_old_files():
         print(f"[CLEANUP] {removed} file dihapus (>{CLEANUP_DAYS} hari)")
 
 # ─────────────────────────────────────────────
-# 🎨  Rich Progress & Logging
+# 🎨  Rich Progress
 # ─────────────────────────────────────────────
 progress_bar = Progress(
     SpinnerColumn(),
@@ -191,16 +198,6 @@ progress_bar = Progress(
 )
 SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 def get_spinner(i): return SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
-
-def log_activity(msg: str):
-    """Log activity ke file dan console"""
-    timestamp = datetime.now().strftime("%d/%m %H:%M:%S")
-    log_msg = f"[{timestamp}] {msg}"
-    print(log_msg)
-    try:
-        with open(log_file, "a") as f:
-            f.write(log_msg + "\n")
-    except: pass
 
 # ─────────────────────────────────────────────
 # 🛠️  Helper
@@ -266,19 +263,10 @@ def get_referer(url: str) -> str:
 # 📥  Download engine
 # ─────────────────────────────────────────────
 def download_video(url, filename, folder, chat_id=None, retry=0, message_id=None):
-    if shutdown_event.is_set():
-        return False, None, "Bot sedang shutdown"
-    
     if retry >= MAX_RETRIES:
-        with failed_urls_lock:
-            failed_urls.add(url)
-        log_activity(f"[FINAL_FAIL] {url[:80]}... setelah {MAX_RETRIES} retry")
         return False, None, "Maksimal retry tercapai"
-    
     if retry > 0:
-        wait_time = min(2 ** retry, 30)  # Cap at 30s
-        log_activity(f"[RETRY {retry}] {url[:80]}... tunggu {wait_time}s")
-        time.sleep(wait_time)
+        time.sleep(2 ** retry)
 
     filepath = os.path.join(folder, filename)
     command = [
@@ -352,13 +340,8 @@ def download_video(url, filename, folder, chat_id=None, retry=0, message_id=None
             os.remove(filepath)
         return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
 
-    except subprocess.TimeoutExpired:
-        log_activity(f"[TIMEOUT] {url[:80]}... ({TIMEOUT}s)")
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
     except Exception as e:
-        log_activity(f"[ERROR] {url[:80]}... {str(e)[:80]}")
+        print(f"[ERROR] {e}")
         if os.path.exists(filepath):
             os.remove(filepath)
         return download_video(url, filename, folder, chat_id, retry + 1, message_id=message_id)
@@ -400,92 +383,82 @@ def send_message_sync(chat_id, text, message_id=None, reply_markup=None):
 # 👷  Worker
 # ─────────────────────────────────────────────
 def worker():
-    while not shutdown_event.is_set():
-        try:
-            item = download_queue.get(timeout=2)
-            if item is None:
-                break
-        except queue.Empty:
-            continue
-        except Exception as e:
-            log_activity(f"[WORKER_ERROR] {str(e)[:100]}")
-            continue
+    while True:
+        item = download_queue.get()
+        if item is None:
+            break
 
-        try:
-            url, custom_name, chat_id, folder = item
+        url, custom_name, chat_id, folder = item
 
-            with stats_lock:
-                download_stats['queue_size'] = download_queue.qsize()
+        with stats_lock:
+            download_stats['queue_size'] = download_queue.qsize()
 
-            filename = custom_name or extract_filename_from_url(url)
+        filename = custom_name or extract_filename_from_url(url)
 
-            with downloads_lock:
-                active_downloads.setdefault(chat_id, []).append(filename)
+        with downloads_lock:
+            active_downloads.setdefault(chat_id, []).append(filename)
 
-            msg = send_message_sync(
-                chat_id,
-                f"⏬ *Memulai download...*\n"
-                f"📁 `{filename}`\n"
-                f"💾 Folder: `{folder}`\n"
-                f"📊 Antrian: {download_queue.qsize()}"
-            )
-            message_id = msg.message_id if msg else None
+        msg = send_message_sync(
+            chat_id,
+            f"⏬ *Memulai download...*\n"
+            f"📁 `{filename}`\n"
+            f"💾 Folder: `{folder}`\n"
+            f"📊 Antrian: {download_queue.qsize()}"
+        )
+        message_id = msg.message_id if msg else None
 
-            success, path, status = download_video(
-                url, filename, folder, chat_id, message_id=message_id
-            )
+        success, path, status = download_video(
+            url, filename, folder, chat_id, message_id=message_id
+        )
 
-            with downloads_lock:
-                lst = active_downloads.get(chat_id, [])
-                if filename in lst:
-                    lst.remove(filename)
+        with downloads_lock:
+            lst = active_downloads.get(chat_id, [])
+            if filename in lst:
+                lst.remove(filename)
 
-            with stats_lock:
-                if success:
-                    download_stats['success'] += 1
-                    # Jika ini retry dari yang pernah gagal, kurangi failed
-                    with failed_urls_lock:
-                        if url in failed_urls:
-                            failed_urls.discard(url)
-                            download_stats['failed'] = max(0, download_stats['failed'] - 1)
-                    send_message_sync(
-                        chat_id,
-                        f"✅ *Download Berhasil!*\n"
-                        f"📁 `{filename}`\n"
-                        f"💾 `{folder}`\n"
-                        f"ℹ️ {status}",
-                        message_id=message_id
-                    )
-                else:
-                    download_stats['failed'] += 1
-                    # Catat URL gagal & hapus dari cache agar bisa di-retry
-                    with processed_lock:
-                        processed_links.discard(url)
-                    with failed_urls_lock:
-                        failed_urls.add(url)
-                    send_message_sync(
-                        chat_id,
-                        f"❌ *Download Gagal*\n"
-                        f"📁 `{filename}`\n"
-                        f"⚠️ {status}\n\n"
-                        f"🔁 Link sudah dihapus dari cache, kirim ulang untuk retry.",
-                        message_id=message_id
-                    )
-                download_stats['queue_size'] = download_queue.qsize()
+        with stats_lock:
+            if success:
+                download_stats['success'] += 1
+                # Jika ini retry dari yang pernah gagal, kurangi failed
+                with failed_urls_lock:
+                    if url in failed_urls:
+                        failed_urls.discard(url)
+                        download_stats['failed'] = max(0, download_stats['failed'] - 1)
+                send_message_sync(
+                    chat_id,
+                    f"✅ *Download Berhasil!*\n"
+                    f"📁 `{filename}`\n"
+                    f"💾 `{folder}`\n"
+                    f"ℹ️ {status}",
+                    message_id=message_id
+                )
+            else:
+                download_stats['failed'] += 1
+                # Catat URL gagal & hapus dari cache agar bisa di-retry
+                with processed_lock:
+                    processed_links.discard(url)
+                with failed_urls_lock:
+                    failed_urls.add(url)
+                send_message_sync(
+                    chat_id,
+                    f"❌ *Download Gagal*\n"
+                    f"📁 `{filename}`\n"
+                    f"⚠️ {status}\n\n"
+                    f"🔁 Link sudah dihapus dari cache, kirim ulang untuk retry.",
+                    message_id=message_id
+                )
+            download_stats['queue_size'] = download_queue.qsize()
 
-            save_state()
-        finally:
-            download_queue.task_done()
+        save_state()
+        download_queue.task_done()
 
 def worker_wrapper(wid):
-    while not shutdown_event.is_set():
+    while True:
         try:
             worker()
         except Exception as e:
-            if not shutdown_event.is_set():
-                log_activity(f"  ⚠️ Worker-{wid} crash: {e} — restart 5s...")
-                time.sleep(5)
-    log_activity(f"✅ Worker-{wid} stopped gracefully")
+            print(f"  ⚠️ Worker-{wid} crash: {e} — restart 5s...")
+            time.sleep(5)
 
 # ─────────────────────────────────────────────
 # 🔐  Auth decorator
@@ -547,9 +520,10 @@ def get_back_keyboard():
 def build_folder_choice_keyboard(chat_id) -> InlineKeyboardMarkup:
     rows  = []
     shown = set()
+    default_norm = normalize_dir(DOWNLOAD_DIR_DEFAULT)
 
     if DOWNLOAD_DIR:
-        icon = "🏠" if DOWNLOAD_DIR == DOWNLOAD_DIR_DEFAULT else "📂"
+        icon = "🏠" if DOWNLOAD_DIR == default_norm else "📂"
         rows.append([InlineKeyboardButton(
             f"{icon} Lanjutkan  ·  {DOWNLOAD_DIR}",
             callback_data=f"dlf_use|{DOWNLOAD_DIR}"
@@ -557,16 +531,16 @@ def build_folder_choice_keyboard(chat_id) -> InlineKeyboardMarkup:
         shown.add(DOWNLOAD_DIR)
 
     for h in get_folder_history(chat_id):
-        if h not in shown and h != DOWNLOAD_DIR_DEFAULT:
+        if h not in shown and h != default_norm:
             rows.append([InlineKeyboardButton(
                 f"🕒 {h}", callback_data=f"dlf_use|{h}"
             )])
             shown.add(h)
 
-    if DOWNLOAD_DIR_DEFAULT not in shown:
+    if default_norm not in shown:
         rows.append([InlineKeyboardButton(
-            f"🏠 Default  ·  {DOWNLOAD_DIR_DEFAULT}",
-            callback_data=f"dlf_use|{DOWNLOAD_DIR_DEFAULT}"
+            f"🏠 Default  ·  {default_norm}",
+            callback_data=f"dlf_use|{default_norm}"
         )])
 
     rows.append([InlineKeyboardButton("✏️ Folder baru…", callback_data="dlf_new")])
@@ -575,6 +549,7 @@ def build_folder_choice_keyboard(chat_id) -> InlineKeyboardMarkup:
 def build_global_folder_keyboard() -> InlineKeyboardMarkup:
     rows  = []
     shown = set()
+    default_norm = normalize_dir(DOWNLOAD_DIR_DEFAULT)
 
     if DOWNLOAD_DIR:
         rows.append([InlineKeyboardButton(
@@ -583,10 +558,10 @@ def build_global_folder_keyboard() -> InlineKeyboardMarkup:
         )])
         shown.add(DOWNLOAD_DIR)
 
-    if DOWNLOAD_DIR_DEFAULT not in shown:
+    if default_norm not in shown:
         rows.append([InlineKeyboardButton(
-            f"🏠 Default  ·  {DOWNLOAD_DIR_DEFAULT}",
-            callback_data=f"gf_use|{DOWNLOAD_DIR_DEFAULT}"
+            f"🏠 Default  ·  {default_norm}",
+            callback_data=f"gf_use|{default_norm}"
         )])
 
     rows.append([InlineKeyboardButton("✏️ Ketik nama folder baru", callback_data="gf_new")])
@@ -870,10 +845,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         links = pending.get("links", [])
         apply_download_dir(chosen, chat_id)
-        added, dupes, full = queue_links_to_download(links, chat_id, chosen)
+        added, dupes, full = queue_links_to_download(links, chat_id, DOWNLOAD_DIR)
         await query.answer(f"✅ {added} link masuk antrian")
         await query.edit_message_text(
-            format_queue_result(added, dupes, full, chosen),
+            format_queue_result(added, dupes, full, DOWNLOAD_DIR),
             parse_mode='Markdown'
         )
 
@@ -1024,9 +999,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pend = pending_links.pop(chat_id, {})
             links = pend.get("links", [])
             apply_download_dir(folder_name, chat_id)
-            added, dupes, full = queue_links_to_download(links, chat_id, folder_name)
+            added, dupes, full = queue_links_to_download(links, chat_id, DOWNLOAD_DIR)
             await update.message.reply_text(
-                format_queue_result(added, dupes, full, folder_name),
+                format_queue_result(added, dupes, full, DOWNLOAD_DIR),
                 parse_mode='Markdown'
             )
         return
@@ -1068,13 +1043,13 @@ def run_bot():
     global DOWNLOAD_DIR
 
     saved_dir = load_state()
-    if not DOWNLOAD_DIR and saved_dir:
-        DOWNLOAD_DIR = saved_dir
-        print(f"[FOLDER] Dimuat dari state: '{DOWNLOAD_DIR}'")
 
-    if DOWNLOAD_DIR:
-        Path(DOWNLOAD_DIR).mkdir(exist_ok=True)
-        cleanup_old_files()
+    # Tentukan folder awal — normalize semua sumber agar masuk Downloads/
+    raw = _DOWNLOAD_DIR_ENV or saved_dir or DOWNLOAD_DIR_DEFAULT
+    DOWNLOAD_DIR = normalize_dir(raw)
+    print(f"[FOLDER] Dimuat: '{DOWNLOAD_DIR}'")
+    Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+    cleanup_old_files()
 
     progress_bar.start()
 
@@ -1144,12 +1119,8 @@ def run_bot():
         import traceback
         traceback.print_exc()
     finally:
-        shutdown_event.set()
-        print("🛑 Menunggu workers shutdown...")
-        time.sleep(2)
         save_state()
         progress_bar.stop()
-        log_activity("[SHUTDOWN] Bot stopped")
 
 if __name__ == "__main__":
     print("🎬 Video Downloader Bot Starting...")
